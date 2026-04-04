@@ -57,3 +57,7 @@ Thumbs.db
 backups/
 pgdata/
 /out/
+# Local temp/work artifacts
+.codex_tmp/
+tests_runtime/
+pytest-cache-files-*/
