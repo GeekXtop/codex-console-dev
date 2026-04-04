@@ -753,7 +753,7 @@ function renderAccounts(accounts) {
             <td>
                 <div class="cpa-status">
                     ${account.cpa_uploaded
-                        ? `<span class="cpa-status-dot" title="已上传于 ${format.date(account.cpa_uploaded_at)}"></span>`
+                        ? `<span class="cpa-status-dot" title="已导入调度平台于 ${format.date(account.cpa_uploaded_at)}"></span>`
                         : ``}
                 </div>
             </td>

@@ -317,6 +317,24 @@ def account_to_response(account: Account) -> AccountResponse:
     )
 
 
+def _mark_accounts_scheduler_uploaded(db, account_ids: List[int]) -> None:
+    """将账号标记为已导入任一调度平台。"""
+    normalized_ids = sorted({int(account_id) for account_id in (account_ids or []) if int(account_id) > 0})
+    if not normalized_ids:
+        return
+
+    uploaded_at = utcnow_naive()
+    accounts = db.query(Account).filter(Account.id.in_(normalized_ids)).all()
+    if not accounts:
+        return
+
+    for account in accounts:
+        account.cpa_uploaded = True
+        account.cpa_uploaded_at = uploaded_at
+
+    db.commit()
+
+
 def _extract_cookie_value(cookies_text: Optional[str], cookie_name: str) -> str:
     text = str(cookies_text or "")
     if not text:
@@ -2242,6 +2260,9 @@ async def batch_upload_accounts_to_sub2api(request: BatchSub2ApiUploadRequest):
         concurrency=request.concurrency,
         priority=request.priority,
     )
+    success_ids = [detail.get("id") for detail in (results.get("details") or []) if detail.get("success")]
+    with get_db() as db:
+        _mark_accounts_scheduler_uploaded(db, success_ids)
     return results
 
 
@@ -2285,6 +2306,7 @@ async def upload_account_to_sub2api(account_id: int, request: Optional[Sub2ApiUp
             target_type="sub2api"
         )
         if success:
+            _mark_accounts_scheduler_uploaded(db, [account.id])
             return {"success": True, "message": message}
         else:
             return {"success": False, "error": message}
@@ -2338,12 +2360,16 @@ async def batch_upload_accounts_to_new_api(request: BatchNewApiUploadRequest):
             request.status_filter, request.email_service_filter, request.search_filter
         )
 
-    return batch_upload_to_new_api(
+    results = batch_upload_to_new_api(
         ids,
         service.api_url,
         getattr(service, 'username', None),
         getattr(service, 'password', None),
     )
+    success_ids = [detail.get("id") for detail in (results.get("details") or []) if detail.get("success")]
+    with get_db() as db:
+        _mark_accounts_scheduler_uploaded(db, success_ids)
+    return results
 
 
 @router.post("/{account_id}/upload-new-api")
@@ -2373,6 +2399,8 @@ async def upload_account_to_new_api(account_id: int, request: Optional[NewApiUpl
             getattr(service, 'username', None),
             getattr(service, 'password', None),
         )
+        if success:
+            _mark_accounts_scheduler_uploaded(db, [account.id])
         return {"success": success, "message": message if success else None, "error": None if success else message}
 
 
@@ -2394,11 +2422,15 @@ async def batch_upload_accounts_to_codex2api(request: BatchCodex2ApiUploadReques
             request.status_filter, request.email_service_filter, request.search_filter
         )
 
-    return batch_upload_to_codex2api(
+    results = batch_upload_to_codex2api(
         ids,
         service.api_url,
         service.admin_key,
     )
+    success_ids = [detail.get("id") for detail in (results.get("details") or []) if detail.get("success")]
+    with get_db() as db:
+        _mark_accounts_scheduler_uploaded(db, success_ids)
+    return results
 
 
 @router.post("/{account_id}/upload-codex2api")
@@ -2427,6 +2459,8 @@ async def upload_account_to_codex2api(account_id: int, request: Optional[Codex2A
             service.api_url,
             service.admin_key,
         )
+        if success:
+            _mark_accounts_scheduler_uploaded(db, [account.id])
         return {"success": success, "message": message if success else None, "error": None if success else message}
 
 
@@ -2468,6 +2502,9 @@ async def batch_upload_accounts_to_tm(request: BatchUploadTMRequest):
         )
 
     results = batch_upload_to_team_manager(ids, api_url, api_key)
+    success_ids = [detail.get("id") for detail in (results.get("details") or []) if detail.get("success")]
+    with get_db() as db:
+        _mark_accounts_scheduler_uploaded(db, success_ids)
     return results
 
 
@@ -2495,6 +2532,9 @@ async def upload_account_to_tm(account_id: int, request: Optional[UploadTMReques
             raise HTTPException(status_code=404, detail="账号不存在")
         success, message = upload_to_team_manager(account, api_url, api_key)
 
+    if success:
+        with get_db() as db:
+            _mark_accounts_scheduler_uploaded(db, [account_id])
     return {"success": success, "message": message}
 
 
