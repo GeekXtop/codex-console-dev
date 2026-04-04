@@ -1,4 +1,4 @@
-﻿"""
+"""
 注册任务 API 路由
 """
 
@@ -6,6 +6,8 @@ import asyncio
 import logging
 import uuid
 import random
+import threading
+import time
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Tuple, Any, Callable
 
@@ -51,6 +53,61 @@ router = APIRouter()
 running_tasks: dict = {}
 # 批量任务存储
 batch_tasks: Dict[str, dict] = {}
+_OUTLOOK_ACCOUNT_CLAIM_LOCK = threading.RLock()
+_OUTLOOK_ACCOUNT_CLAIM_TTL_SECONDS = 30 * 60
+_OUTLOOK_ACCOUNT_CLAIMS: Dict[str, Dict[str, Any]] = {}
+RECOVERED_RUNNING_TASK_ERROR = '应用重启后检测到遗留运行任务，已自动标记失败'
+RECOVERED_PENDING_TASK_ERROR = '应用重启后检测到遗留排队任务，已自动标记取消'
+
+
+def _normalize_outlook_account_email(email: Optional[str]) -> str:
+    return str(email or "").strip().lower()
+
+
+def _cleanup_stale_outlook_account_claims(now_ts: Optional[float] = None) -> None:
+    now_value = float(now_ts or time.time())
+    stale_emails: List[str] = []
+    for email, meta in list(_OUTLOOK_ACCOUNT_CLAIMS.items()):
+        claimed_at = float((meta or {}).get("claimed_at") or 0)
+        if claimed_at and (now_value - claimed_at) <= _OUTLOOK_ACCOUNT_CLAIM_TTL_SECONDS:
+            continue
+        stale_emails.append(email)
+    for email in stale_emails:
+        _OUTLOOK_ACCOUNT_CLAIMS.pop(email, None)
+
+
+def _claim_outlook_account(email: Optional[str], task_uuid: str, service_id: Optional[int] = None) -> bool:
+    email_norm = _normalize_outlook_account_email(email)
+    if not email_norm:
+        return False
+    with _OUTLOOK_ACCOUNT_CLAIM_LOCK:
+        _cleanup_stale_outlook_account_claims()
+        current = _OUTLOOK_ACCOUNT_CLAIMS.get(email_norm)
+        if current and str(current.get("task_uuid") or "") != str(task_uuid):
+            return False
+        _OUTLOOK_ACCOUNT_CLAIMS[email_norm] = {
+            "email": email_norm,
+            "task_uuid": str(task_uuid),
+            "service_id": service_id,
+            "claimed_at": time.time(),
+        }
+        return True
+
+
+def _release_outlook_account(email: Optional[str], task_uuid: Optional[str] = None) -> None:
+    email_norm = _normalize_outlook_account_email(email)
+    if not email_norm:
+        return
+    with _OUTLOOK_ACCOUNT_CLAIM_LOCK:
+        current = _OUTLOOK_ACCOUNT_CLAIMS.get(email_norm)
+        if not current:
+            return
+        current_task_uuid = str(current.get("task_uuid") or "")
+        if task_uuid and current_task_uuid and current_task_uuid != str(task_uuid):
+            return
+        _OUTLOOK_ACCOUNT_CLAIMS.pop(email_norm, None)
+
+
 
 
 def _mark_task_cancelled(db, task_uuid: str, message: str = "任务已取消") -> None:
@@ -94,6 +151,44 @@ def _cancel_batch_tasks(batch_id: str) -> None:
             message=f"自动补货取消中: {batch_id}",
         )
         add_auto_registration_log(f"[自动注册] 已提交补货批量任务取消请求: {batch_id}")
+
+
+def recover_interrupted_registration_tasks() -> Dict[str, int]:
+    """回收因进程退出残留在数据库中的注册任务状态。"""
+    recovered = {
+        "running_recovered": 0,
+        "pending_recovered": 0,
+    }
+    recovered_at = utcnow_naive()
+
+    with get_db() as db:
+        stale_running_tasks = db.query(RegistrationTask).filter(RegistrationTask.status == "running").all()
+        stale_pending_tasks = db.query(RegistrationTask).filter(RegistrationTask.status == "pending").all()
+
+        for task in stale_running_tasks:
+            task.status = "failed"
+            task.completed_at = recovered_at
+            if not str(task.error_message or "").strip():
+                task.error_message = RECOVERED_RUNNING_TASK_ERROR
+            recovered["running_recovered"] += 1
+
+        for task in stale_pending_tasks:
+            task.status = "cancelled"
+            task.completed_at = recovered_at
+            if not str(task.error_message or "").strip():
+                task.error_message = RECOVERED_PENDING_TASK_ERROR
+            recovered["pending_recovered"] += 1
+
+        if recovered["running_recovered"] or recovered["pending_recovered"]:
+            db.commit()
+            logger.warning(
+                "启动时已回收遗留注册任务: running=%s, pending=%s",
+                recovered["running_recovered"],
+                recovered["pending_recovered"],
+            )
+
+    return recovered
+
 
 def get_proxy_for_registration(db) -> Tuple[Optional[str], Optional[int]]:
     """
@@ -184,6 +279,10 @@ class RegistrationTaskResponse(BaseModel):
     logs: Optional[str] = None
     result: Optional[dict] = None
     error_message: Optional[str] = None
+    recovered_on_startup: bool = False
+    recovery_reason: Optional[str] = None
+    email_service_name: Optional[str] = None
+    email_service_type: Optional[str] = None
     created_at: Optional[str] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
@@ -301,8 +400,19 @@ class ScheduledRegistrationJobListResponse(BaseModel):
 
 # ============== Helper Functions ==============
 
+def _get_task_recovery_reason(task: RegistrationTask) -> Optional[str]:
+    message = str(getattr(task, "error_message", "") or "").strip()
+    if str(getattr(task, "status", "") or "") == "failed" and message == RECOVERED_RUNNING_TASK_ERROR:
+        return "startup_recovered_running"
+    if str(getattr(task, "status", "") or "") == "cancelled" and message == RECOVERED_PENDING_TASK_ERROR:
+        return "startup_recovered_pending"
+    return None
+
+
 def task_to_response(task: RegistrationTask) -> RegistrationTaskResponse:
     """转换任务模型为响应"""
+    recovery_reason = _get_task_recovery_reason(task)
+    email_service = getattr(task, "email_service", None)
     return RegistrationTaskResponse(
         id=task.id,
         task_uuid=task.task_uuid,
@@ -312,6 +422,10 @@ def task_to_response(task: RegistrationTask) -> RegistrationTaskResponse:
         logs=task.logs,
         result=task.result,
         error_message=task.error_message,
+        recovered_on_startup=bool(recovery_reason),
+        recovery_reason=recovery_reason,
+        email_service_name=getattr(email_service, "name", None),
+        email_service_type=getattr(email_service, "service_type", None),
         created_at=task.created_at.isoformat() if task.created_at else None,
         started_at=task.started_at.isoformat() if task.started_at else None,
         completed_at=task.completed_at.isoformat() if task.completed_at else None,
@@ -460,6 +574,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
     这个函数会被 run_in_executor 调用，运行在独立线程中
     """
     with get_db() as db:
+        claimed_outlook_email: Optional[str] = None
         try:
             _check_task_cancelled_or_raise(task_uuid, "启动前")
 
@@ -489,11 +604,11 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
 
             service_type = EmailServiceType(email_service_type)
             settings = get_settings()
-
-            if email_service_id:
+            bound_email_service_id = email_service_id or getattr(task, "email_service_id", None)
+            if bound_email_service_id:
                 from ...database.models import EmailService as EmailServiceModel
                 db_service = db.query(EmailServiceModel).filter(
-                    EmailServiceModel.id == email_service_id,
+                    EmailServiceModel.id == bound_email_service_id,
                     EmailServiceModel.enabled == True
                 ).first()
 
@@ -502,8 +617,16 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                     config = _normalize_email_service_config(service_type, db_service.config, actual_proxy_url)
                     crud.update_registration_task(db, task_uuid, email_service_id=db_service.id)
                     logger.info(f"使用数据库邮箱服务: {db_service.name} (ID: {db_service.id}, 类型: {service_type.value})")
+                    if service_type == EmailServiceType.OUTLOOK:
+                        outlook_email = _normalize_outlook_account_email((db_service.config or {}).get("email"))
+                        if not outlook_email:
+                            raise ValueError(f"Outlook 账户缺少邮箱配置: {db_service.id}")
+                        if not _claim_outlook_account(outlook_email, task_uuid, db_service.id):
+                            logger.warning(f"Outlook 账户已被当前批次占用，无法重复使用: {outlook_email}")
+                            raise ValueError(f"Outlook 账户已被当前批次占用: {outlook_email}")
+                        claimed_outlook_email = outlook_email
                 else:
-                    raise ValueError(f"邮箱服务不存在或已禁用: {email_service_id}")
+                    raise ValueError(f"邮箱服务不存在或已禁用: {bound_email_service_id}")
             else:
                 if service_type == EmailServiceType.TEMPMAIL:
                     if not settings.tempmail_enabled:
@@ -558,14 +681,20 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                     selected_service = None
                     for svc in outlook_services:
                         email = svc.config.get("email") if svc.config else None
-                        if not email:
+                        email_norm = _normalize_outlook_account_email(email)
+                        if not email_norm:
                             continue
-                        existing = db.query(Account).filter(func.lower(Account.email) == str(email).lower()).first()
-                        if not existing:
-                            selected_service = svc
-                            logger.info(f"选择未注册的 Outlook 账户: {email}")
-                            break
-                        logger.info(f"跳过已注册的 Outlook 账户: {email}")
+                        existing = db.query(Account).filter(func.lower(Account.email) == email_norm).first()
+                        if existing:
+                            logger.info(f"跳过已注册的 Outlook 账户: {email_norm}")
+                            continue
+                        if not _claim_outlook_account(email_norm, task_uuid, svc.id):
+                            logger.info(f"Outlook 账户已被当前批次占用，跳过: {email_norm}")
+                            continue
+                        claimed_outlook_email = email_norm
+                        selected_service = svc
+                        logger.info(f"选择未注册的 Outlook 账户: {email_norm}")
+                        break
 
                     if selected_service and selected_service.config:
                         config = selected_service.config.copy()
@@ -694,6 +823,10 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
             except Exception:
                 marker_context = {}
 
+            def upload_log(message: str) -> None:
+                log_callback(message)
+                logger.info(f"任务 {task_uuid} {message}")
+
             if task_manager.is_cancelled(task_uuid):
                 raise RegistrationCancelled("任务已取消")
 
@@ -751,6 +884,13 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                             account_id=saved_account.account_id,
                         )
 
+                def mark_scheduler_uploaded() -> None:
+                    if not saved_account:
+                        return
+                    saved_account.cpa_uploaded = True
+                    saved_account.cpa_uploaded_at = utcnow_naive()
+                    db.commit()
+
                 skip_auto_upload_for_token_profile = bool(
                     saved_account
                     and _should_skip_auto_upload_for_token_profile(
@@ -768,10 +908,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                     )
                 )
                 if auto_upload_targets_enabled and skip_auto_upload_for_token_profile:
-                    log_callback(
-                        "[上传过滤] 当前账号仅拿到 access_token、未拿到 refresh_token，"
-                        "已按配置跳过上传到管理平台"
-                    )
+                    upload_log("[上传过滤] 当前账号仅拿到 access_token、未拿到 refresh_token，已按配置跳过上传到管理平台")
 
                 _check_task_cancelled_or_raise(task_uuid, "自动上传前")
 
@@ -784,25 +921,23 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                             if not _cpa_ids:
                                 _cpa_ids = [s.id for s in crud.get_cpa_services(db, enabled=True)]
                             if not _cpa_ids:
-                                log_callback("[CPA] 无可用 CPA 服务，跳过上传")
+                                upload_log("[CPA] 无可用 CPA 服务，跳过上传")
                             for _sid in _cpa_ids:
                                 try:
                                     _svc = crud.get_cpa_service_by_id(db, _sid)
                                     if not _svc:
                                         continue
-                                    log_callback(f"[CPA] 正在把账号打包发往服务站: {_svc.name}")
+                                    upload_log(f"[CPA] 正在把账号打包发往服务站: {_svc.name}")
                                     _ok, _msg = upload_to_cpa(token_data, api_url=_svc.api_url, api_token=_svc.api_token)
                                     if _ok:
-                                        saved_account.cpa_uploaded = True
-                                        saved_account.cpa_uploaded_at = utcnow_naive()
-                                        db.commit()
-                                        log_callback(f"[CPA] 投递成功，服务站已签收: {_svc.name}")
+                                        mark_scheduler_uploaded()
+                                        upload_log(f"[CPA] 投递成功，服务站已签收: {_svc.name}")
                                     else:
-                                        log_callback(f"[CPA] 上传失败({_svc.name}): {_msg}")
+                                        upload_log(f"[CPA] 上传失败({_svc.name}): {_msg}")
                                 except Exception as _e:
-                                    log_callback(f"[CPA] 异常({_sid}): {_e}")
+                                    upload_log(f"[CPA] 异常({_sid}): {_e}")
                     except Exception as cpa_err:
-                        log_callback(f"[CPA] 上传异常: {cpa_err}")
+                        upload_log(f"[CPA] 上传异常: {cpa_err}")
 
                 if auto_upload_sub2api and not skip_auto_upload_for_token_profile:
                     try:
@@ -812,19 +947,21 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                             if not _s2a_ids:
                                 _s2a_ids = [s.id for s in crud.get_sub2api_services(db, enabled=True)]
                             if not _s2a_ids:
-                                log_callback("[Sub2API] 无可用 Sub2API 服务，跳过上传")
+                                upload_log("[Sub2API] 无可用 Sub2API 服务，跳过上传")
                             for _sid in _s2a_ids:
                                 try:
                                     _svc = crud.get_sub2api_service_by_id(db, _sid)
                                     if not _svc:
                                         continue
-                                    log_callback(f"[Sub2API] 正在把账号发往服务站: {_svc.name}")
+                                    upload_log(f"[Sub2API] 正在把账号发往服务站: {_svc.name}")
                                     _ok, _msg = upload_to_sub2api([saved_account], _svc.api_url, _svc.api_key)
-                                    log_callback(f"[Sub2API] {'成功' if _ok else '失败'}({_svc.name}): {_msg}")
+                                    if _ok:
+                                        mark_scheduler_uploaded()
+                                    upload_log(f"[Sub2API] {'成功' if _ok else '失败'}({_svc.name}): {_msg}")
                                 except Exception as _e:
-                                    log_callback(f"[Sub2API] 异常({_sid}): {_e}")
+                                    upload_log(f"[Sub2API] 异常({_sid}): {_e}")
                     except Exception as s2a_err:
-                        log_callback(f"[Sub2API] 上传异常: {s2a_err}")
+                        upload_log(f"[Sub2API] 上传异常: {s2a_err}")
 
                 if auto_upload_tm and not skip_auto_upload_for_token_profile:
                     try:
@@ -834,19 +971,21 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                             if not _tm_ids:
                                 _tm_ids = [s.id for s in crud.get_tm_services(db, enabled=True)]
                             if not _tm_ids:
-                                log_callback("[TM] 无可用 Team Manager 服务，跳过上传")
+                                upload_log("[TM] 无可用 Team Manager 服务，跳过上传")
                             for _sid in _tm_ids:
                                 try:
                                     _svc = crud.get_tm_service_by_id(db, _sid)
                                     if not _svc:
                                         continue
-                                    log_callback(f"[TM] 正在把账号发往服务站: {_svc.name}")
+                                    upload_log(f"[TM] 正在把账号发往服务站: {_svc.name}")
                                     _ok, _msg = upload_to_team_manager(saved_account, _svc.api_url, _svc.api_key)
-                                    log_callback(f"[TM] {'成功' if _ok else '失败'}({_svc.name}): {_msg}")
+                                    if _ok:
+                                        mark_scheduler_uploaded()
+                                    upload_log(f"[TM] {'成功' if _ok else '失败'}({_svc.name}): {_msg}")
                                 except Exception as _e:
-                                    log_callback(f"[TM] 异常({_sid}): {_e}")
+                                    upload_log(f"[TM] 异常({_sid}): {_e}")
                     except Exception as tm_err:
-                        log_callback(f"[TM] 上传异常: {tm_err}")
+                        upload_log(f"[TM] 上传异常: {tm_err}")
 
                 if auto_upload_codex2api and not skip_auto_upload_for_token_profile:
                     try:
@@ -856,19 +995,21 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                             if not _codex2api_ids:
                                 _codex2api_ids = [s.id for s in crud.get_codex2api_services(db, enabled=True)]
                             if not _codex2api_ids:
-                                log_callback("[Codex2API] 无可用 Codex2API 服务，跳过上传")
+                                upload_log("[Codex2API] 无可用 Codex2API 服务，跳过上传")
                             for _sid in _codex2api_ids:
                                 try:
                                     _svc = crud.get_codex2api_service_by_id(db, _sid)
                                     if not _svc:
                                         continue
-                                    log_callback(f"[Codex2API] 正在把账号发往服务站: {_svc.name}")
+                                    upload_log(f"[Codex2API] 正在把账号发往服务站: {_svc.name}")
                                     _ok, _msg = upload_to_codex2api([saved_account], _svc.api_url, _svc.admin_key)
-                                    log_callback(f"[Codex2API] {'成功' if _ok else '失败'}({_svc.name}): {_msg}")
+                                    if _ok:
+                                        mark_scheduler_uploaded()
+                                    upload_log(f"[Codex2API] {'成功' if _ok else '失败'}({_svc.name}): {_msg}")
                                 except Exception as _e:
-                                    log_callback(f"[Codex2API] 异常({_sid}): {_e}")
+                                    upload_log(f"[Codex2API] 异常({_sid}): {_e}")
                     except Exception as codex2api_err:
-                        log_callback(f"[Codex2API] 上传异常: {codex2api_err}")
+                        upload_log(f"[Codex2API] 上传异常: {codex2api_err}")
 
                 if auto_upload_new_api and not skip_auto_upload_for_token_profile:
                     try:
@@ -878,24 +1019,26 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                             if not _new_api_ids:
                                 _new_api_ids = [s.id for s in crud.get_new_api_services(db, enabled=True)]
                             if not _new_api_ids:
-                                log_callback("[NewAPI] 无可用 new-api 服务，跳过上传")
+                                upload_log("[NewAPI] 无可用 new-api 服务，跳过上传")
                             for _sid in _new_api_ids:
                                 try:
                                     _svc = crud.get_new_api_service_by_id(db, _sid)
                                     if not _svc:
                                         continue
-                                    log_callback(f"[NewAPI] 正在把账号发往服务站: {_svc.name}")
+                                    upload_log(f"[NewAPI] 正在把账号发往服务站: {_svc.name}")
                                     _ok, _msg = upload_to_new_api(
                                         [saved_account],
                                         _svc.api_url,
                                         getattr(_svc, 'username', None),
                                         getattr(_svc, 'password', None),
                                     )
-                                    log_callback(f"[NewAPI] {'成功' if _ok else '失败'}({_svc.name}): {_msg}")
+                                    if _ok:
+                                        mark_scheduler_uploaded()
+                                    upload_log(f"[NewAPI] {'成功' if _ok else '失败'}({_svc.name}): {_msg}")
                                 except Exception as _e:
-                                    log_callback(f"[NewAPI] 异常({_sid}): {_e}")
+                                    upload_log(f"[NewAPI] 异常({_sid}): {_e}")
                     except Exception as new_api_err:
-                        log_callback(f"[NewAPI] 上传异常: {new_api_err}")
+                        upload_log(f"[NewAPI] 上传异常: {new_api_err}")
 
                 _check_task_cancelled_or_raise(task_uuid, "完成前")
                 crud.update_registration_task(
@@ -958,6 +1101,11 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 task_manager.update_status(task_uuid, "failed", error=str(e))
             except:
                 pass
+
+
+        finally:
+            if claimed_outlook_email:
+                _release_outlook_account(claimed_outlook_email, task_uuid)
 
 
 async def run_registration_task(task_uuid: str, email_service_type: str, proxy: Optional[str], email_service_config: Optional[dict], email_service_id: Optional[int] = None, log_prefix: str = "", batch_id: str = "", auto_upload_cpa: bool = False, cpa_service_ids: List[int] = None, auto_upload_sub2api: bool = False, sub2api_service_ids: List[int] = None, auto_upload_codex2api: bool = False, codex2api_service_ids: List[int] = None, auto_upload_tm: bool = False, tm_service_ids: List[int] = None, auto_upload_new_api: bool = False, new_api_service_ids: List[int] = None, filter_only_access_token_accounts: bool = True, registration_type: str = RoleTag.CHILD.value):
@@ -2392,11 +2540,14 @@ async def run_outlook_batch_registration(
     cpa_service_ids: List[int] = None,
     auto_upload_sub2api: bool = False,
     sub2api_service_ids: List[int] = None,
+    auto_upload_codex2api: bool = False,
+    codex2api_service_ids: List[int] = None,
     auto_upload_tm: bool = False,
     tm_service_ids: List[int] = None,
     auto_upload_new_api: bool = False,
     new_api_service_ids: List[int] = None,
     filter_only_access_token_accounts: bool = True,
+    registration_type: str = RoleTag.CHILD.value,
 ):
     """
     异步执行 Outlook 批量注册任务，复用通用并发逻辑
@@ -2438,11 +2589,14 @@ async def run_outlook_batch_registration(
         cpa_service_ids=cpa_service_ids,
         auto_upload_sub2api=auto_upload_sub2api,
         sub2api_service_ids=sub2api_service_ids,
+        auto_upload_codex2api=auto_upload_codex2api,
+        codex2api_service_ids=codex2api_service_ids,
         auto_upload_tm=auto_upload_tm,
         tm_service_ids=tm_service_ids,
         auto_upload_new_api=auto_upload_new_api,
         new_api_service_ids=new_api_service_ids,
         filter_only_access_token_accounts=filter_only_access_token_accounts,
+        registration_type=registration_type,
     )
 
 

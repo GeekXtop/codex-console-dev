@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
@@ -67,6 +67,47 @@
             width: 100%;
         }
 
+        .recent-registration-tasks-table {
+            max-height: 320px;
+            overflow-y: auto;
+        }
+
+        .recent-registration-tasks-table table {
+            width: 100%;
+        }
+
+        .task-status-stack {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+
+        .task-recovery-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 2px 8px;
+            border-radius: 999px;
+            background: rgba(245, 158, 11, 0.14);
+            color: #b45309;
+            border: 1px solid rgba(245, 158, 11, 0.28);
+            font-size: 0.72rem;
+            font-weight: 600;
+            line-height: 1.2;
+            white-space: nowrap;
+        }
+
+        .task-recovered-row {
+            background: rgba(245, 158, 11, 0.05);
+        }
+
+        .task-subtext {
+            margin-top: 4px;
+            font-size: 0.75rem;
+            line-height: 1.45;
+            color: var(--text-muted);
+        }
         .recent-accounts-table th,
         .recent-accounts-table td {
             padding: var(--spacing-sm) var(--spacing-md);
@@ -804,6 +845,39 @@
                                     </tr>
                                 </tbody>
                             </table>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>🧾 最近注册任务</h3>
+                            <div style="display: flex; gap: var(--spacing-sm);">
+                                <button class="btn btn-ghost btn-sm" id="refresh-recent-tasks-btn">🔄 刷新</button>
+                            </div>
+                        </div>
+                        <div class="card-body" style="padding: 0;">
+                            <div class="recent-registration-tasks-table">
+                                <table class="data-table">
+                                    <thead>
+                                        <tr>
+                                            <th style="width: 92px;">任务</th>
+                                            <th style="width: 132px;">状态</th>
+                                            <th>结果说明</th>
+                                            <th style="width: 188px;">时间</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="recent-registration-tasks-table">
+                                        <tr>
+                                            <td colspan="4">
+                                                <div class="empty-state" style="padding: var(--spacing-md);">
+                                                    <div class="empty-state-icon">🧾</div>
+                                                    <div class="empty-state-title">暂无注册任务</div>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </div>
                         </div>
                     </div>
 

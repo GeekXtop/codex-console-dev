@@ -18,6 +18,8 @@ from ..config.constants import OTP_CODE_PATTERN
 
 logger = logging.getLogger(__name__)
 _STATE_LOCK = threading.RLock()
+_INFLIGHT_EMAIL_TTL_SECONDS = 30 * 60
+_INFLIGHT_EMAILS: Dict[str, Dict[str, Any]] = {}
 # 申诉硬编码开关（临时）：False=关闭申诉提交；True=开启申诉提交。
 LUCKMAIL_APPEAL_ENABLED = False
 
@@ -164,6 +166,46 @@ class LuckMailService(BaseEmailService):
             if item:
                 return item
         return None
+
+    def _cleanup_inflight_email_claims(self, now_ts: Optional[float] = None) -> None:
+        now_value = float(now_ts or time.time())
+        stale_emails: List[str] = []
+        for email, meta in list(_INFLIGHT_EMAILS.items()):
+            claimed_at = float((meta or {}).get("claimed_at") or 0)
+            if claimed_at and (now_value - claimed_at) <= _INFLIGHT_EMAIL_TTL_SECONDS:
+                continue
+            stale_emails.append(email)
+        for email in stale_emails:
+            _INFLIGHT_EMAILS.pop(email, None)
+
+    def _claim_email(self, email: Optional[str], extra: Optional[Dict[str, Any]] = None) -> bool:
+        email_norm = self._normalize_email(email)
+        if not email_norm:
+            return False
+        with _STATE_LOCK:
+            self._cleanup_inflight_email_claims()
+            if email_norm in _INFLIGHT_EMAILS:
+                return False
+            record: Dict[str, Any] = {
+                "email": email_norm,
+                "claimed_at": time.time(),
+                "updated_at": self._now_iso(),
+                "service_name": self.name,
+            }
+            if extra:
+                for key in ("service_id", "order_no", "token", "purchase_id", "source"):
+                    value = extra.get(key)
+                    if value not in (None, ""):
+                        record[key] = value
+            _INFLIGHT_EMAILS[email_norm] = record
+            return True
+
+    def _release_claimed_email(self, email: Optional[str]) -> None:
+        email_norm = self._normalize_email(email)
+        if not email_norm:
+            return
+        with _STATE_LOCK:
+            _INFLIGHT_EMAILS.pop(email_norm, None)
 
     def _is_recent_code(self, order_key: str, code: str, now: Optional[float] = None) -> bool:
         if not order_key or not code:
@@ -398,21 +440,24 @@ class LuckMailService(BaseEmailService):
         context: Optional[Dict[str, Any]] = None,
     ) -> None:
         """供任务调度层调用：把注册结果落盘，避免后续重复尝试同邮箱。"""
-        if success:
-            self._mark_registered_email(email, extra=context)
-        else:
-            prefer_failed = self._should_force_failed_record(reason)
-            context_copy = dict(context or {})
-            password = str(context_copy.get("generated_password") or context_copy.get("password") or "").strip()
-            if password:
-                context_copy["password"] = password
-            record = self._mark_failed_email(
-                email,
-                reason=reason,
-                extra=context_copy,
-                prefer_failed=prefer_failed,
-            )
-            self._try_submit_appeal(email=email, reason=reason, context=context_copy, failed_record=record)
+        try:
+            if success:
+                self._mark_registered_email(email, extra=context)
+            else:
+                prefer_failed = self._should_force_failed_record(reason)
+                context_copy = dict(context or {})
+                password = str(context_copy.get("generated_password") or context_copy.get("password") or "").strip()
+                if password:
+                    context_copy["password"] = password
+                record = self._mark_failed_email(
+                    email,
+                    reason=reason,
+                    extra=context_copy,
+                    prefer_failed=prefer_failed,
+                )
+                self._try_submit_appeal(email=email, reason=reason, context=context_copy, failed_record=record)
+        finally:
+            self._release_claimed_email(email)
 
     def _resolve_order_id_by_order_no(self, order_no: str, max_pages: int = 3, page_size: int = 50) -> Optional[int]:
         order_no_text = str(order_no or "").strip()
@@ -723,6 +768,9 @@ class LuckMailService(BaseEmailService):
                     },
                 )
                 continue
+            if not self._claim_email(email, info):
+                logger.info(f"LuckMail 复用邮箱已被当前批次占用，跳过: {email}")
+                continue
             return info
         return None
 
@@ -857,6 +905,7 @@ class LuckMailService(BaseEmailService):
             request_config.get("inbox_mode") or request_config.get("mode") or self.config.get("inbox_mode")
         )
 
+        claimed_in_picker = False
         if inbox_mode == "order":
             order_info = self._create_order_inbox(
                 project_code=project_code,
@@ -872,6 +921,7 @@ class LuckMailService(BaseEmailService):
                 )
                 if reused:
                     order_info = reused
+                    claimed_in_picker = True
                 else:
                     order_info = self._create_purchase_inbox(
                         project_code=project_code,
@@ -884,6 +934,12 @@ class LuckMailService(BaseEmailService):
                     email_type=email_type,
                     preferred_domain=preferred_domain,
                 )
+
+        if not claimed_in_picker:
+            email = self._normalize_email(order_info.get("email"))
+            if not self._claim_email(email, order_info):
+                logger.warning(f"LuckMail 邮箱已被并发任务占用，放弃本次分配: {email}")
+                raise EmailServiceError(f"LuckMail 邮箱已被并发任务占用: {email}")
 
         self._cache_order(order_info)
         self.update_status(True)
@@ -1016,6 +1072,7 @@ class LuckMailService(BaseEmailService):
                 email = str(item.get("email") or "").strip().lower()
                 if email:
                     self._orders_by_email.pop(email, None)
+                    self._release_claimed_email(email)
             if token:
                 self._recent_codes_by_order.pop(f"token:{token}", None)
             if order_no:

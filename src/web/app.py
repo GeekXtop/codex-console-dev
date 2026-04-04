@@ -63,7 +63,7 @@ def create_app() -> FastAPI:
         from ..core.db_logs import cleanup_database_logs
         from ..database.init_db import initialize_database
         from .auto_quick_refresh_scheduler import auto_quick_refresh_scheduler
-        from .routes.registration import run_auto_registration_batch
+        from .routes.registration import run_auto_registration_batch, recover_interrupted_registration_tasks
         from .selfcheck_scheduler import selfcheck_scheduler
 
         try:
@@ -73,6 +73,14 @@ def create_app() -> FastAPI:
 
         loop = asyncio.get_running_loop()
         task_manager.set_loop(loop)
+
+        recovered_registration_tasks = await asyncio.to_thread(recover_interrupted_registration_tasks)
+        if recovered_registration_tasks.get("running_recovered") or recovered_registration_tasks.get("pending_recovered"):
+            logger.warning(
+                "Recovered interrupted registration tasks on startup: running=%s pending=%s",
+                recovered_registration_tasks.get("running_recovered", 0),
+                recovered_registration_tasks.get("pending_recovered", 0),
+            )
 
         global auto_registration_coordinator
         auto_registration_coordinator = AutoRegistrationCoordinator(

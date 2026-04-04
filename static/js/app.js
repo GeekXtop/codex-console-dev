@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 注册页面 JavaScript
  * 使用 utils.js 中的工具库
  */
@@ -12,6 +12,7 @@ let autoMonitorPollingInterval = null;
 let accountsPollingInterval = null;
 let todayStatsPollingInterval = null;
 let todayStatsResetInterval = null;
+let recentTasksPollingInterval = null;
 let isBatchMode = false;
 let isOutlookBatchMode = false;
 let isAutoMode = false;
@@ -95,6 +96,8 @@ const elements = {
     // 已注册账号
     recentAccountsTable: document.getElementById('recent-accounts-table'),
     refreshAccountsBtn: document.getElementById('refresh-accounts-btn'),
+    recentRegistrationTasksTable: document.getElementById('recent-registration-tasks-table'),
+    refreshRecentTasksBtn: document.getElementById('refresh-recent-tasks-btn'),
     // 今日统计
     todayStatsTotal: document.getElementById('today-stats-total'),
     todayStatsSuccess: document.getElementById('today-stats-success'),
@@ -168,9 +171,11 @@ document.addEventListener('DOMContentLoaded', () => {
     handleModeChange({ target: elements.regMode });
     loadAvailableServices();
     loadRecentAccounts();
+    loadRecentTasks();
     loadAutoRegistrationSettings();
     loadAutoRegistrationCpaOptions();
     startAccountsPolling();
+    startRecentTasksPolling();
     loadTodayStats(true);
     startTodayStatsPolling();
     startTodayStatsResetTicker();
@@ -298,6 +303,13 @@ function initEventListeners() {
         loadRecentAccounts();
         toast.info('已刷新');
     });
+
+    if (elements.refreshRecentTasksBtn) {
+        elements.refreshRecentTasksBtn.addEventListener('click', () => {
+            loadRecentTasks();
+            toast.info('任务列表已刷新');
+        });
+    }
 
     // 并发模式切换
     elements.concurrencyMode.addEventListener('change', () => {
@@ -1834,6 +1846,121 @@ function updateBatchProgress(data) {
         elements.batchSuccess.dataset.last = data.success;
         elements.batchFailed.dataset.last = data.failed;
     }
+}
+
+// 加载最近注册任务
+function getRegistrationTaskStatusMeta(status) {
+    const normalized = String(status || '').trim().toLowerCase();
+    const mapping = {
+        pending: { text: '等待中', className: 'pending' },
+        running: { text: '运行中', className: 'running' },
+        completed: { text: '已完成', className: 'completed' },
+        failed: { text: '失败', className: 'failed' },
+        cancelled: { text: '已取消', className: 'disabled' },
+    };
+    return mapping[normalized] || { text: status || '-', className: 'pending' };
+}
+
+function formatRecentTaskTime(task) {
+    const source = task.completed_at || task.started_at || task.created_at;
+    if (!source) return '-';
+    const parsed = new Date(source);
+    if (Number.isNaN(parsed.getTime())) return escapeHtml(source);
+    return escapeHtml(parsed.toLocaleString('zh-CN', { hour12: false }));
+}
+
+function buildRecentTaskSummary(task) {
+    if (task.recovered_on_startup) {
+        return task.status === 'failed'
+            ? '启动时自动回收了上次残留的运行任务'
+            : '启动时自动回收了上次残留的排队任务';
+    }
+
+    if (task.status === 'completed') {
+        const resultEmail = task.result && task.result.email ? String(task.result.email) : '';
+        return resultEmail ? `注册成功：${resultEmail}` : '任务已完成';
+    }
+
+    if (task.error_message) {
+        return String(task.error_message);
+    }
+
+    if (task.status === 'running') return '任务仍在执行中';
+    if (task.status === 'pending') return '任务仍在等待调度';
+    return '暂无额外说明';
+}
+
+async function loadRecentTasks() {
+    if (!elements.recentRegistrationTasksTable) return;
+
+    try {
+        const data = await api.get('/registration/tasks?page=1&page_size=12');
+        const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+
+        if (!tasks.length) {
+            elements.recentRegistrationTasksTable.innerHTML = `
+                <tr>
+                    <td colspan="4">
+                        <div class="empty-state" style="padding: var(--spacing-md);">
+                            <div class="empty-state-icon">🧾</div>
+                            <div class="empty-state-title">暂无注册任务</div>
+                        </div>
+                    </td>
+                </tr>
+            `;
+            return;
+        }
+
+        elements.recentRegistrationTasksTable.innerHTML = tasks.map(task => {
+            const status = getRegistrationTaskStatusMeta(task.status);
+            const taskId = escapeHtml(String(task.task_uuid || '').slice(0, 8) || '-');
+            const serviceText = task.email_service_name
+                ? escapeHtml(task.email_service_name)
+                : (task.email_service_type ? escapeHtml(getServiceTypeText(task.email_service_type)) : (task.email_service_id ? `服务 #${task.email_service_id}` : '未绑定服务'));
+            const summary = escapeHtml(buildRecentTaskSummary(task));
+            const recoveryBadge = task.recovered_on_startup
+                ? '<span class="task-recovery-badge">启动回收</span>'
+                : '';
+            return `
+                <tr class="${task.recovered_on_startup ? 'task-recovered-row' : ''}">
+                    <td>
+                        <div style="font-weight: 600;">${taskId}</div>
+                        <div class="task-subtext">${serviceText}</div>
+                    </td>
+                    <td>
+                        <div class="task-status-stack">
+                            <span class="status-badge ${status.className}">${escapeHtml(status.text)}</span>
+                            ${recoveryBadge}
+                        </div>
+                    </td>
+                    <td>
+                        <div>${summary}</div>
+                        ${task.recovered_on_startup ? `<div class="task-subtext">${escapeHtml(task.error_message || '')}</div>` : ''}
+                    </td>
+                    <td>${formatRecentTaskTime(task)}</td>
+                </tr>
+            `;
+        }).join('');
+    } catch (error) {
+        elements.recentRegistrationTasksTable.innerHTML = `
+            <tr>
+                <td colspan="4">
+                    <div class="empty-state" style="padding: var(--spacing-md);">
+                        <div class="empty-state-title">加载失败：${escapeHtml(error.message)}</div>
+                    </div>
+                </td>
+            </tr>
+        `;
+    }
+}
+
+function startRecentTasksPolling() {
+    if (recentTasksPollingInterval) {
+        clearInterval(recentTasksPollingInterval);
+    }
+    recentTasksPollingInterval = setInterval(() => {
+        loadRecentTasks();
+    }, 60000);
 }
 
 // 加载最近注册的账号
