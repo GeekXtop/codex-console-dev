@@ -373,7 +373,7 @@ function updateEmailServiceOptions() {
     // Outlook
     if (availableServices.outlook.available) {
         const optgroup = document.createElement('optgroup');
-        optgroup.label = `📧 Outlook (${availableServices.outlook.count} 个账户)`;
+        optgroup.label = `📧 Outlook / Hotmail (${availableServices.outlook.count} 个账户)`;
 
         availableServices.outlook.services.forEach(service => {
             const option = document.createElement('option');
@@ -389,12 +389,12 @@ function updateEmailServiceOptions() {
         // Outlook 批量注册选项
         const batchOption = document.createElement('option');
         batchOption.value = 'outlook_batch:all';
-        batchOption.textContent = `📋 Outlook 批量注册 (${availableServices.outlook.count} 个账户)`;
+        batchOption.textContent = `📋 Outlook / Hotmail 批量注册 (${availableServices.outlook.count} 个账户)`;
         batchOption.dataset.type = 'outlook_batch';
         optgroup.appendChild(batchOption);
     } else {
         const optgroup = document.createElement('optgroup');
-        optgroup.label = '📧 Outlook (未配置)';
+        optgroup.label = '📧 Outlook / Hotmail (未配置)';
 
         const option = document.createElement('option');
         option.value = '';
@@ -2105,7 +2105,7 @@ async function loadOutlookAccounts() {
 // 渲染 Outlook 账户列表
 function renderOutlookAccountsList() {
     if (outlookAccounts.length === 0) {
-        elements.outlookAccountsContainer.innerHTML = '<div style="text-align: center; padding: var(--spacing-md); color: var(--text-muted);">没有可用的 Outlook 账户</div>';
+        elements.outlookAccountsContainer.innerHTML = '<div style="text-align: center; padding: var(--spacing-md); color: var(--text-muted);">没有可用的 Outlook / Hotmail 账户</div>';
         return;
     }
 
@@ -2165,7 +2165,7 @@ async function handleOutlookBatchRegistration() {
     });
 
     if (selectedIds.length === 0) {
-        toast.error('请选择至少一个 Outlook 账户');
+        toast.error('请选择至少一个 Outlook / Hotmail 账户');
         return;
     }
 

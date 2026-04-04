@@ -134,6 +134,38 @@ def filter_sensitive_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return filtered
 
 
+def parse_outlook_import_line(line: str) -> Dict[str, Any]:
+    """解析 Outlook / Hotmail / Live 批量导入行。"""
+    normalized_line = str(line or "").strip().lstrip("\ufeff")
+    parts = [part.strip() for part in normalized_line.split("----")]
+
+    if len(parts) < 2:
+        raise ValueError("格式错误，至少需要邮箱和密码")
+
+    email = str(parts[0] or "").strip().lower()
+    password = str(parts[1] or "").strip()
+
+    if not email or "@" not in email:
+        raise ValueError(f"无效的邮箱地址: {parts[0].strip()}")
+
+    if not password:
+        raise ValueError("密码不能为空")
+
+    config = {
+        "email": email,
+        "password": password,
+    }
+
+    if len(parts) >= 4:
+        client_id = str(parts[2] or "").strip()
+        refresh_token = str(parts[3] or "").strip()
+        if client_id and refresh_token:
+            config["client_id"] = client_id
+            config["refresh_token"] = refresh_token
+
+    return config
+
+
 def service_to_response(service: EmailServiceModel) -> EmailServiceResponse:
     """?????????"""
     normalized_config = normalize_email_service_config(service.service_type, service.config)
@@ -263,8 +295,8 @@ async def get_service_types():
             },
             {
                 "value": "outlook",
-                "label": "Outlook",
-                "description": "Outlook 邮箱，需要配置账户信息",
+                "label": "Outlook / Hotmail",
+                "description": "Microsoft 邮箱（Outlook / Hotmail / Live），需要配置账户信息",
                 "config_fields": [
                     {"name": "email", "label": "邮箱地址", "required": True},
                     {"name": "password", "label": "密码", "required": True},
@@ -420,15 +452,28 @@ async def create_email_service(request: EmailServiceCreate):
         raise HTTPException(status_code=400, detail=f"无效的服务类型: {request.service_type}")
 
     with get_db() as db:
+        normalized_config = normalize_email_service_config(request.service_type, request.config)
+        normalized_name = str(request.name or "").strip()
+        if request.service_type == "outlook":
+            normalized_name = str(normalized_config.get("email") or normalized_name).strip().lower()
+            if normalized_name:
+                normalized_config["email"] = normalized_name
+
         # 检查名称是否重复
-        existing = db.query(EmailServiceModel).filter(EmailServiceModel.name == request.name).first()
+        if request.service_type == "outlook":
+            existing = db.query(EmailServiceModel).filter(
+                EmailServiceModel.service_type == "outlook",
+                func.lower(EmailServiceModel.name) == normalized_name
+            ).first()
+        else:
+            existing = db.query(EmailServiceModel).filter(EmailServiceModel.name == normalized_name).first()
         if existing:
             raise HTTPException(status_code=400, detail="服务名称已存在")
 
         service = EmailServiceModel(
             service_type=request.service_type,
-            name=request.name,
-            config=normalize_email_service_config(request.service_type, request.config),
+            name=normalized_name,
+            config=normalized_config,
             enabled=request.enabled,
             priority=request.priority
         )
@@ -586,72 +631,49 @@ async def reorder_services(service_ids: List[int]):
 @router.post("/outlook/batch-import", response_model=OutlookBatchImportResponse)
 async def batch_import_outlook(request: OutlookBatchImportRequest):
     """
-    批量导入 Outlook 邮箱账户
+    批量导入 Outlook / Hotmail / Live 邮箱账户。
 
     支持两种格式：
     - 格式一（密码认证）：邮箱----密码
     - 格式二（XOAUTH2 认证）：邮箱----密码----client_id----refresh_token
 
-    每行一个账户，使用四个连字符（----）分隔字段
+    每行一个账户，使用四个连字符（----）分隔字段。
     """
-    lines = request.data.strip().split("\n")
-    total = len(lines)
+    lines = request.data.splitlines()
+    valid_lines = [line for line in lines if str(line or "").strip() and not str(line or "").strip().startswith("#")]
+    total = len(valid_lines)
     success = 0
     failed = 0
     accounts = []
     errors = []
 
     with get_db() as db:
-        for i, line in enumerate(lines):
-            line = line.strip()
+        for i, raw_line in enumerate(lines):
+            line = str(raw_line or "").strip()
 
             # 跳过空行和注释
             if not line or line.startswith("#"):
                 continue
 
-            parts = line.split("----")
-
-            # 验证格式
-            if len(parts) < 2:
+            try:
+                config = parse_outlook_import_line(line)
+            except ValueError as exc:
                 failed += 1
-                errors.append(f"行 {i+1}: 格式错误，至少需要邮箱和密码")
+                errors.append(f"行 {i + 1}: {exc}")
                 continue
 
-            email = parts[0].strip()
-            password = parts[1].strip()
+            email = config["email"]
 
-            # 验证邮箱格式
-            if "@" not in email:
-                failed += 1
-                errors.append(f"行 {i+1}: 无效的邮箱地址: {email}")
-                continue
-
-            # 检查是否已存在
             existing = db.query(EmailServiceModel).filter(
                 EmailServiceModel.service_type == "outlook",
-                EmailServiceModel.name == email
+                func.lower(EmailServiceModel.name) == email
             ).first()
 
             if existing:
                 failed += 1
-                errors.append(f"行 {i+1}: 邮箱已存在: {email}")
+                errors.append(f"行 {i + 1}: 邮箱已存在: {email}")
                 continue
 
-            # 构建配置
-            config = {
-                "email": email,
-                "password": password
-            }
-
-            # 检查是否有 OAuth 信息（格式二）
-            if len(parts) >= 4:
-                client_id = parts[2].strip()
-                refresh_token = parts[3].strip()
-                if client_id and refresh_token:
-                    config["client_id"] = client_id
-                    config["refresh_token"] = refresh_token
-
-            # 创建服务记录
             try:
                 service = EmailServiceModel(
                     service_type="outlook",
@@ -667,14 +689,14 @@ async def batch_import_outlook(request: OutlookBatchImportRequest):
                 accounts.append({
                     "id": service.id,
                     "email": email,
-                    "has_oauth": bool(config.get("client_id")),
+                    "has_oauth": bool(config.get("client_id") and config.get("refresh_token")),
                     "name": email
                 })
                 success += 1
 
             except Exception as e:
                 failed += 1
-                errors.append(f"行 {i+1}: 创建失败: {str(e)}")
+                errors.append(f"行 {i + 1}: 创建失败: {str(e)}")
                 db.rollback()
 
     return OutlookBatchImportResponse(

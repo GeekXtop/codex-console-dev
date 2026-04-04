@@ -43,7 +43,7 @@
             <div class="stats-grid">
                 <div class="stat-card info">
                     <div class="stat-value" id="outlook-count">0</div>
-                    <div class="stat-label">Outlook 账户</div>
+                    <div class="stat-label">Microsoft 邮箱</div>
                 </div>
                 <div class="stat-card success">
                     <div class="stat-value" id="custom-count">0</div>
@@ -62,21 +62,21 @@
             <!-- Outlook 管理 -->
             <div class="card">
                 <div class="card-header">
-                    <h3>📥 Outlook 批量导入</h3>
+                    <h3>📥 Microsoft 邮箱批量导入</h3>
                     <button class="btn btn-ghost btn-sm" id="toggle-outlook-import">展开</button>
                 </div>
                 <div class="card-body" id="outlook-import-body" style="display: none;">
                     <div class="import-info">
                         <p><strong>支持格式：</strong></p>
                         <ul>
-                            <li><code>邮箱----密码</code> （密码认证）</li>
+                            <li><code>邮箱----密码</code> （密码认证，支持 Outlook / Hotmail / Live）</li>
                             <li><code>邮箱----密码----client_id----refresh_token</code> （XOAUTH2 认证，推荐）</li>
                         </ul>
                         <p>每行一个账户，使用四个连字符（----）分隔字段。以 # 开头的行将被忽略。</p>
                     </div>
                     <div class="form-group">
                         <label for="outlook-import-data">批量导入数据</label>
-                        <textarea id="outlook-import-data" rows="8" placeholder="example@outlook.com----password123&#10;test@outlook.com----password456----client_id----refresh_token"></textarea>
+                        <textarea id="outlook-import-data" rows="8" placeholder="example@hotmail.com----password123&#10;test@outlook.com----password456----client_id----refresh_token"></textarea>
                     </div>
                     <div class="form-row">
                         <div class="form-group">
@@ -135,10 +135,10 @@
                 </div>
             </div>
 
-            <!-- Outlook 账户列表 -->
+            <!-- Microsoft 邮箱列表 -->
             <div class="card">
                 <div class="card-header">
-                    <h3>📧 Outlook 账户列表</h3>
+                    <h3>📧 Microsoft 邮箱列表</h3>
                     <button class="btn btn-danger btn-sm" id="batch-delete-outlook-btn" disabled>🗑️ 批量删除</button>
                 </div>
                 <div class="card-body" style="padding: 0;">
@@ -683,11 +683,11 @@
         </div>
     </div>
 
-    <!-- 编辑 Outlook 账户模态框 -->
+    <!-- 编辑 Microsoft 邮箱模态框 -->
     <div class="modal" id="edit-outlook-modal">
         <div class="modal-content">
             <div class="modal-header">
-                <h3>✏️ 编辑 Outlook 账户</h3>
+                <h3>✏️ 编辑 Microsoft 邮箱</h3>
                 <button class="modal-close" id="close-edit-outlook-modal">&times;</button>
             </div>
             <div class="modal-body">

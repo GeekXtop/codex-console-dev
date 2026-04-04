@@ -560,7 +560,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                         email = svc.config.get("email") if svc.config else None
                         if not email:
                             continue
-                        existing = db.query(Account).filter(Account.email == email).first()
+                        existing = db.query(Account).filter(func.lower(Account.email) == str(email).lower()).first()
                         if not existing:
                             selected_service = svc
                             logger.info(f"选择未注册的 Outlook 账户: {email}")
@@ -2353,7 +2353,7 @@ async def get_outlook_accounts_for_registration():
 
             # 检查是否已注册（查询 accounts 表）
             existing_account = db.query(Account).filter(
-                Account.email == email
+                func.lower(Account.email) == str(email).lower()
             ).first()
 
             is_registered = existing_account is not None

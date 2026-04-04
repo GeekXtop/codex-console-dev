@@ -2,6 +2,9 @@
 
 ## v1.1.3
 
+- 新增 Microsoft 邮箱导入兼容：Outlook 批量导入现支持直接粘贴 Hotmail / Live 的 `邮箱----密码----client_id----refresh_token` 文本，导入时统一规范化邮箱大小写并复用原有注册链路。
+- 修复 Microsoft 邮箱状态判定的大小写匹配：导入查重、Outlook 账户可注册判断与注册状态展示统一按邮箱小写比较，避免 Hotmail / Outlook 大小写差异导致重复导入或重复注册。
+
 - 修复 OpenAI 注册 400 链路：主注册流程与 anyauto 流程按步骤补齐 `oai-device-id` 与完整 `openai-sentinel-token`，不再复用旧的空壳 sentinel 包装。
 - 新增 Playwright 版 Sentinel 浏览器取 token 辅助，并补齐 `organization/select` 收尾逻辑与对应回归测试，降低 `create_account` / consent 收尾阶段失败率。
 - 修复原生注册收尾分支的 `continue_url` 兜底优先级：优先复用 `create_account`/OTP 已返回的 consent 链路，避免误退回旧的 OAuth authorize 地址导致重定向链丢失。
