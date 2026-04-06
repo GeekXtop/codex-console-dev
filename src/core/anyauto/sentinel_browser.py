@@ -128,11 +128,26 @@ def get_sentinel_token_via_browser(
                 logger("Sentinel Browser 等待 SentinelSDK 超时")
                 return None
 
+            token_timeout_ms = max(3000, min(int(timeout_ms or 45000), 20000))
             result = page.evaluate(
                 """
-                async ({ flow }) => {
+                async ({ flow, tokenTimeoutMs }) => {
                     try {
-                        const token = await window.SentinelSDK.token(flow);
+                        const token = await new Promise((resolve, reject) => {
+                            const timer = window.setTimeout(() => {
+                                reject(new Error(`token timeout after ${tokenTimeoutMs}ms`));
+                            }, tokenTimeoutMs);
+                            Promise.resolve(window.SentinelSDK.token(flow)).then(
+                                (value) => {
+                                    window.clearTimeout(timer);
+                                    resolve(value);
+                                },
+                                (error) => {
+                                    window.clearTimeout(timer);
+                                    reject(error);
+                                }
+                            );
+                        });
                         return { success: true, token };
                     } catch (e) {
                         return {
@@ -142,14 +157,15 @@ def get_sentinel_token_via_browser(
                     }
                 }
                 """,
-                {"flow": flow},
+                {"flow": flow, "tokenTimeoutMs": token_timeout_ms},
             )
 
             if not result or not result.get("success") or not result.get("token"):
-                logger(
-                    "Sentinel Browser 获取失败: "
-                    + str((result or {}).get("error") or "no result")
-                )
+                error_text = str((result or {}).get("error") or "no result")
+                if error_text.startswith("token timeout after"):
+                    logger(f"Sentinel Browser 获取 token 超时: {token_timeout_ms}ms")
+                else:
+                    logger("Sentinel Browser 获取失败: " + error_text)
                 return None
 
             token = str(result["token"] or "").strip()
@@ -174,3 +190,4 @@ def get_sentinel_token_via_browser(
             return None
         finally:
             browser.close()
+

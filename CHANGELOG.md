@@ -72,3 +72,6 @@
 - 补充仓库忽略规则：新增忽略 `.codex_tmp/`、`tests_runtime/` 与 `pytest-cache-files-*`，避免提交本地临时脚本与测试缓存。
 
 - 补充仓库忽略规则：新增忽略 .omx/ 运行态目录，避免提交本地 HUD/通知/tmux 状态、指标与日志文件。
+
+- 修复注册任务在 about-you 阶段可能无限卡住的问题：Sentinel Browser 调用 window.SentinelSDK.token(flow) 时新增浏览器侧超时兜底，避免单个任务长时间停留在 running 并拖住批量进度。
+
