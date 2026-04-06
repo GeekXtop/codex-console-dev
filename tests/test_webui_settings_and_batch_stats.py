@@ -160,6 +160,78 @@ def test_cancel_batch_marks_pending_child_tasks(monkeypatch):
     assert not any(task_uuid == "task-b" and kwargs["status"] == "cancelled" for task_uuid, kwargs in updates)
 
 
+def test_stop_batch_due_to_luckmail_no_stock_cancels_pending_tasks(monkeypatch):
+    batch_id = "batch-no-stock"
+    registration.batch_tasks[batch_id] = {
+        "task_uuids": ["task-a", "task-b"],
+        "finished": False,
+        "cancelled": False,
+        "logs": [],
+    }
+
+    tasks = {
+        "task-a": DummyTask(status="pending"),
+        "task-b": DummyTask(status="running"),
+    }
+    cancelled = []
+    status_updates = []
+    updates = []
+    batch_logs = []
+
+    @contextmanager
+    def fake_get_db():
+        yield object()
+
+    def fake_get_registration_task(db, task_uuid):
+        return tasks[task_uuid]
+
+    def fake_update_registration_task(db, task_uuid, **kwargs):
+        updates.append((task_uuid, kwargs))
+        task = tasks[task_uuid]
+        for key, value in kwargs.items():
+            setattr(task, key, value)
+        return task
+
+    monkeypatch.setattr(registration, "get_db", fake_get_db)
+    monkeypatch.setattr(registration.crud, "get_registration_task", fake_get_registration_task)
+    monkeypatch.setattr(registration.crud, "update_registration_task", fake_update_registration_task)
+    monkeypatch.setattr(registration.task_manager, "cancel_batch", lambda current_batch_id: cancelled.append(("batch", current_batch_id)))
+    monkeypatch.setattr(registration.task_manager, "cancel_task", lambda task_uuid: cancelled.append(("task", task_uuid)))
+    monkeypatch.setattr(registration.task_manager, "update_batch_status", lambda *args, **kwargs: status_updates.append((args, kwargs)))
+    monkeypatch.setattr(registration.task_manager, "add_batch_log", lambda current_batch_id, message: batch_logs.append((current_batch_id, message)))
+
+    registration._stop_batch_due_to_luckmail_no_stock(batch_id, "key=batch-no-stock")
+
+    assert registration.batch_tasks[batch_id]["cancelled"] is True
+    assert registration.batch_tasks[batch_id]["stop_reason"] == "key=batch-no-stock"
+    assert ("batch", batch_id) in cancelled
+    assert ("task", "task-a") in cancelled
+    assert ("task", "task-b") in cancelled
+    assert any(task_uuid == "task-a" and kwargs["status"] == "cancelled" for task_uuid, kwargs in updates)
+    assert batch_logs and "[邮箱预热] LuckMail 连续无库存，当前批次已停止" in batch_logs[0][1]
+    assert status_updates and status_updates[0][1]["status"] == "cancelling"
+
+
+def test_get_batch_status_includes_incremental_logs():
+    batch_id = "batch-logs"
+    registration.batch_tasks[batch_id] = {
+        "total": 3,
+        "completed": 1,
+        "success": 1,
+        "failed": 0,
+        "current_index": 1,
+        "cancelled": False,
+        "finished": False,
+        "logs": ["[系统] 启动", "[邮箱预热] LuckMail 批量预扫描完成"],
+        "stop_reason": None,
+    }
+
+    result = asyncio.run(registration.get_batch_status(batch_id, cursor=1))
+
+    assert result["logs"] == ["[邮箱预热] LuckMail 批量预扫描完成"]
+    assert result["next_cursor"] == 2
+
+
 def test_run_sync_registration_task_marks_cancelled_on_cooperative_stop(monkeypatch):
     updates = []
     statuses = []

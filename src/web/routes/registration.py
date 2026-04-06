@@ -155,6 +155,24 @@ def _cancel_batch_tasks(batch_id: str) -> None:
         add_auto_registration_log(f"[自动注册] 已提交补货批量任务取消请求: {batch_id}")
 
 
+def _stop_batch_due_to_luckmail_no_stock(batch_id: str, reason: str) -> None:
+    batch = batch_tasks.get(batch_id)
+    if not batch:
+        task_manager.cancel_batch(batch_id)
+        return
+
+    log_message = f"[邮箱预热] LuckMail 连续无库存，当前批次已停止: {reason}"
+    already_logged = log_message in list(batch.get("logs", []))
+    batch["cancelled"] = True
+    batch["stop_reason"] = reason
+    task_manager.cancel_batch(batch_id)
+    if not already_logged:
+        batch.setdefault("logs", []).append(log_message)
+        task_manager.add_batch_log(batch_id, log_message)
+    task_manager.update_batch_status(batch_id, cancelled=True, status="cancelling", stop_reason=reason)
+    _cancel_batch_tasks(batch_id)
+
+
 def recover_interrupted_registration_tasks() -> Dict[str, int]:
     """回收因进程退出残留在数据库中的注册任务状态。"""
     recovered = {
@@ -857,6 +875,7 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                 config = dict(config or {})
                 if batch_id:
                     config["batch_id"] = batch_id
+                    config["_no_stock_threshold_callback"] = _stop_batch_due_to_luckmail_no_stock
 
             email_service = EmailServiceFactory.create(service_type, config)
             log_callback = task_manager.create_log_callback(task_uuid, prefix=log_prefix, batch_id=batch_id)
@@ -2212,12 +2231,14 @@ async def start_batch_registration(
 
 
 @router.get("/batch/{batch_id}")
-async def get_batch_status(batch_id: str):
+async def get_batch_status(batch_id: str, cursor: int = Query(0, ge=0)):
     """获取批量任务状态"""
     if batch_id not in batch_tasks:
         raise HTTPException(status_code=404, detail="批量任务不存在")
 
     batch = batch_tasks[batch_id]
+    logs = list(batch.get("logs", []))
+    safe_cursor = max(0, min(int(cursor or 0), len(logs)))
     return {
         "batch_id": batch_id,
         "total": batch["total"],
@@ -2227,7 +2248,10 @@ async def get_batch_status(batch_id: str):
         "current_index": batch["current_index"],
         "cancelled": batch["cancelled"],
         "finished": batch.get("finished", False),
-        "progress": f"{batch['completed']}/{batch['total']}"
+        "progress": f"{batch['completed']}/{batch['total']}",
+        "logs": logs[safe_cursor:],
+        "next_cursor": len(logs),
+        "stop_reason": batch.get("stop_reason"),
     }
 
 

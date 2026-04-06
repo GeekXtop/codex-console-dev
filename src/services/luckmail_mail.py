@@ -4,7 +4,6 @@ LuckMail 邮箱服务实现
 
 import logging
 import json
-import os
 import re
 import sys
 import threading
@@ -28,7 +27,6 @@ _BATCH_REUSE_PREPARED: Set[str] = set()
 _BATCH_PURCHASE_GATES: Dict[str, threading.Lock] = {}
 _BATCH_PURCHASE_NEXT_ALLOWED_AT: Dict[str, float] = {}
 _NO_STOCK_BREAKERS: Dict[str, Dict[str, Any]] = {}
-_NO_STOCK_SHUTDOWN_REQUESTED = False
 # 申诉硬编码开关（临时）：False=关闭申诉提交；True=开启申诉提交。
 LUCKMAIL_APPEAL_ENABLED = False
 
@@ -100,25 +98,6 @@ def _get_batch_purchase_gate(batch_key: str) -> threading.Lock:
             _BATCH_PURCHASE_GATES[key] = gate
         return gate
 
-
-def _schedule_luckmail_no_stock_process_exit(reason: str, delay_seconds: float = 0.5) -> None:
-    def _exit_worker() -> None:
-        sleep_seconds = max(float(delay_seconds or 0.0), 0.0)
-        if sleep_seconds > 0:
-            time.sleep(sleep_seconds)
-        try:
-            sys.stdout.flush()
-            sys.stderr.flush()
-        except Exception:
-            pass
-        os._exit(86)
-
-    thread = threading.Thread(
-        target=_exit_worker,
-        name="luckmail-no-stock-exit",
-        daemon=True,
-    )
-    thread.start()
 
 def _coerce_bool(value: Any, default: bool) -> bool:
     if isinstance(value, bool):
@@ -253,6 +232,11 @@ class LuckMailService(BaseEmailService):
         self.config["poll_interval"] = float(self.config.get("poll_interval") or 3.0)
         self.config["code_reuse_ttl"] = int(self.config.get("code_reuse_ttl") or 600)
         self.config["batch_purchase_min_interval_seconds"] = max(float(self.config.get("batch_purchase_min_interval_seconds") or 1.0), 0.0)
+        self._no_stock_threshold_callback = (
+            self.config.get("_no_stock_threshold_callback")
+            if callable(self.config.get("_no_stock_threshold_callback"))
+            else None
+        )
 
         if not self.config["api_key"]:
             raise ValueError("LuckMail 配置缺少 api_key")
@@ -325,30 +309,35 @@ class LuckMailService(BaseEmailService):
         return aliases.get(mode, "purchase")
 
     def _no_stock_breaker_key(self, batch_id: str = "") -> str:
-        batch_key = _normalize_batch_key(batch_id)
-        return batch_key or "__global__"
+        return _normalize_batch_key(batch_id)
 
     def _reset_no_stock_breaker(self, batch_id: str = "") -> None:
         key = self._no_stock_breaker_key(batch_id)
+        if not key:
+            return
         with _STATE_LOCK:
             _NO_STOCK_BREAKERS.pop(key, None)
 
-    def _raise_if_no_stock_shutdown_requested(self) -> None:
+    def _raise_if_no_stock_shutdown_requested(self, batch_id: str = "") -> None:
         if not bool(self.config.get("no_stock_shutdown_enabled", True)):
             return
+        key = self._no_stock_breaker_key(batch_id)
+        if not key:
+            return
         with _STATE_LOCK:
-            requested = bool(_NO_STOCK_SHUTDOWN_REQUESTED)
+            requested = bool((_NO_STOCK_BREAKERS.get(key) or {}).get("stop_requested"))
         if requested:
-            raise EmailServiceError("LuckMail 连续无库存触发熔断，进程即将终止")
+            raise EmailServiceError("LuckMail 连续无库存触发批次熔断，当前批次已停止")
 
     def _register_no_stock_failure(self, batch_id: str, action: str, error: Any) -> bool:
-        global _NO_STOCK_SHUTDOWN_REQUESTED
         if not bool(self.config.get("no_stock_shutdown_enabled", True)):
             return False
         if not self._is_no_stock_error(error):
             return False
 
         key = self._no_stock_breaker_key(batch_id)
+        if not key:
+            return False
         threshold = max(int(self.config.get("no_stock_shutdown_threshold") or 5), 1)
         window_seconds = max(float(self.config.get("no_stock_shutdown_window_seconds") or 60.0), 1.0)
         now_ts = time.time()
@@ -357,18 +346,21 @@ class LuckMailService(BaseEmailService):
             last_at = float(current.get("last_at") or 0.0)
             first_at = float(current.get("first_at") or 0.0)
             count = int(current.get("count") or 0)
+            stop_requested = bool(current.get("stop_requested"))
             if last_at <= 0 or (now_ts - last_at) > window_seconds:
                 count = 0
                 first_at = now_ts
+                stop_requested = False
             count += 1
             _NO_STOCK_BREAKERS[key] = {
                 "count": count,
                 "first_at": first_at or now_ts,
                 "last_at": now_ts,
+                "stop_requested": stop_requested,
             }
-            should_shutdown = count >= threshold and not _NO_STOCK_SHUTDOWN_REQUESTED
+            should_shutdown = count >= threshold and not stop_requested
             if should_shutdown:
-                _NO_STOCK_SHUTDOWN_REQUESTED = True
+                _NO_STOCK_BREAKERS[key]["stop_requested"] = True
 
         logger.warning(
             "LuckMail 无库存熔断计数: key=%s action=%s count=%s/%s window=%.1fs",
@@ -383,11 +375,12 @@ class LuckMailService(BaseEmailService):
                 f"key={key}, action={action}, count={count}, threshold={threshold}, "
                 f"error={str(error or "").strip()[:240]}"
             )
-            logger.critical("LuckMail 连续无库存触发进程终止: %s", reason)
-            _schedule_luckmail_no_stock_process_exit(
-                reason,
-                delay_seconds=float(self.config.get("no_stock_shutdown_exit_delay_seconds", 0.5)),
-            )
+            logger.critical("LuckMail 连续无库存触发批次熔断: %s", reason)
+            if self._no_stock_threshold_callback:
+                try:
+                    self._no_stock_threshold_callback(batch_id, reason)
+                except Exception as exc:
+                    logger.warning(f"LuckMail 批次熔断回调执行失败: {exc}")
         return should_shutdown
 
     def _is_no_stock_error(self, error: Any) -> bool:
@@ -1529,7 +1522,7 @@ class LuckMailService(BaseEmailService):
         return order_info
 
     def _run_batch_purchase_action(self, batch_id: str, action: str, func):
-        self._raise_if_no_stock_shutdown_requested()
+        self._raise_if_no_stock_shutdown_requested(batch_id)
         batch_key = _normalize_batch_key(batch_id)
         if not batch_key:
             return func()
@@ -1574,7 +1567,7 @@ class LuckMailService(BaseEmailService):
         except Exception as exc:
             self.update_status(False, exc)
             if self._register_no_stock_failure(batch_id, "create_order", exc):
-                raise EmailServiceError(f"LuckMail 连续无库存触发熔断，进程即将终止: {exc}")
+                raise EmailServiceError(f"LuckMail 连续无库存触发批次熔断，当前批次已停止: {exc}")
             raise EmailServiceError(f"LuckMail 创建订单失败: {exc}")
 
         order_no = str(self._extract_field(order, "order_no") or "").strip()
@@ -1678,7 +1671,7 @@ class LuckMailService(BaseEmailService):
         except Exception as exc:
             self.update_status(False, exc)
             if self._register_no_stock_failure(batch_id, "purchase_emails", exc):
-                raise EmailServiceError(f"LuckMail 连续无库存触发熔断，进程即将终止: {exc}")
+                raise EmailServiceError(f"LuckMail 连续无库存触发批次熔断，当前批次已停止: {exc}")
             raise EmailServiceError(f"LuckMail 购买邮箱失败: {exc}")
 
         item = self._extract_first_purchase_item(purchased)
@@ -1710,7 +1703,6 @@ class LuckMailService(BaseEmailService):
         }
 
     def create_email(self, config: Dict[str, Any] = None) -> Dict[str, Any]:
-        self._raise_if_no_stock_shutdown_requested()
         request_config = config or {}
         project_code = str(request_config.get("project_code") or self.config["project_code"]).strip()
         email_type = str(request_config.get("email_type") or self.config["email_type"]).strip()
@@ -1721,6 +1713,7 @@ class LuckMailService(BaseEmailService):
             or ""
         ).strip().lstrip("@")
         batch_id = _normalize_batch_key(request_config.get("batch_id") or self.config.get("batch_id"))
+        self._raise_if_no_stock_shutdown_requested(batch_id)
 
 
         inbox_mode = self._normalize_inbox_mode(
@@ -1781,7 +1774,7 @@ class LuckMailService(BaseEmailService):
                     and self._is_no_stock_error(exc)
                 ):
                     raise
-                self._raise_if_no_stock_shutdown_requested()
+                self._raise_if_no_stock_shutdown_requested(batch_id)
                 logger.warning(
                     "LuckMail purchase 模式无库存，自动回退 order 模式: "
                     f"project_code={project_code}, email_type={email_type}, domain={preferred_domain or '-'}"

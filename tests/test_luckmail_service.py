@@ -141,7 +141,6 @@ def build_service(monkeypatch, user, config=None, python_client_cls=FakeClient, 
         monkeypatch.setattr(luckmail_module, "_load_luckmail_client_class", lambda: (python_client_cls, "python:test"))
     monkeypatch.setattr(luckmail_module, "_has_luckmail_rust_sdk_assets", lambda: True)
     monkeypatch.setattr(luckmail_module, "_NO_STOCK_BREAKERS", {})
-    monkeypatch.setattr(luckmail_module, "_NO_STOCK_SHUTDOWN_REQUESTED", False)
     monkeypatch.setattr(luckmail_module, "_BATCH_REUSE_POOLS", {})
     monkeypatch.setattr(luckmail_module, "_BATCH_REUSE_PREPARED", set())
     monkeypatch.setattr(
@@ -673,7 +672,7 @@ def test_create_order_uses_batch_gate_when_batch_id_present(monkeypatch):
     assert result["order_no"] == "ord-batch-1"
     assert gate_calls == [("batch-order", "create_order")]
 
-def test_repeated_no_stock_requests_process_exit(monkeypatch):
+def test_repeated_no_stock_requests_stop_batch_callback(monkeypatch):
     user = FakeUser()
     user.create_order_results = [
         RuntimeError('LuckMail Rust CLI 执行失败: Error: Api { code: 2003, message: "无库存", data: None }'),
@@ -690,22 +689,18 @@ def test_repeated_no_stock_requests_process_exit(monkeypatch):
             "no_stock_shutdown_exit_delay_seconds": 0,
         },
     )
-    exit_requests = []
-    monkeypatch.setattr(
-        luckmail_module,
-        "_schedule_luckmail_no_stock_process_exit",
-        lambda reason, delay_seconds=0.5: exit_requests.append((reason, delay_seconds)),
-    )
+    stop_requests = []
+    service._no_stock_threshold_callback = lambda batch_id, reason: stop_requests.append((batch_id, reason))
 
     with pytest.raises(luckmail_module.EmailServiceError, match="创建订单失败"):
         service.create_email({"batch_id": "batch-stop"})
 
-    with pytest.raises(luckmail_module.EmailServiceError, match="连续无库存触发熔断"):
+    with pytest.raises(luckmail_module.EmailServiceError, match="连续无库存触发批次熔断"):
         service.create_email({"batch_id": "batch-stop"})
 
-    assert exit_requests
-    assert "batch-stop" in exit_requests[0][0]
-    assert exit_requests[0][1] == 0
+    assert len(stop_requests) == 1
+    assert stop_requests[0][0] == "batch-stop"
+    assert "batch-stop" in stop_requests[0][1]
 
 
 def test_success_resets_no_stock_breaker(monkeypatch):
@@ -725,12 +720,8 @@ def test_success_resets_no_stock_breaker(monkeypatch):
             "no_stock_shutdown_window_seconds": 60,
         },
     )
-    exit_requests = []
-    monkeypatch.setattr(
-        luckmail_module,
-        "_schedule_luckmail_no_stock_process_exit",
-        lambda reason, delay_seconds=0.5: exit_requests.append((reason, delay_seconds)),
-    )
+    stop_requests = []
+    service._no_stock_threshold_callback = lambda batch_id, reason: stop_requests.append((batch_id, reason))
 
     with pytest.raises(luckmail_module.EmailServiceError, match="创建订单失败"):
         service.create_email({"batch_id": "batch-reset"})
@@ -741,4 +732,4 @@ def test_success_resets_no_stock_breaker(monkeypatch):
     with pytest.raises(luckmail_module.EmailServiceError, match="创建订单失败"):
         service.create_email({"batch_id": "batch-reset"})
 
-    assert exit_requests == []
+    assert stop_requests == []

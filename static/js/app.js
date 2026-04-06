@@ -52,6 +52,7 @@ let wsReconnectAttempts = 0;
 let batchWsReconnectAttempts = 0;
 let wsManualClose = false;
 let batchWsManualClose = false;
+let batchLogCursor = 0;
 let autoMonitorLastLogIndex = 0;
 
 const WS_RECONNECT_BASE_DELAY = 1000;
@@ -1453,6 +1454,7 @@ async function handleBatchRegistration(requestData) {
     // 重置批量任务状态
     batchCompleted = false;
     batchFinalStatus = null;
+    batchLogCursor = 0;
     displayedLogs.clear();  // 清空日志去重集合
     toastShown = false;  // 重置 toast 标志
 
@@ -1625,8 +1627,7 @@ function startBatchPolling(batchId) {
 
     batchPollingInterval = setInterval(async () => {
         try {
-            const data = await api.get(`/registration/batch/${batchId}`);
-            updateBatchProgress(data);
+            const data = await syncBatchSnapshot(batchId);
 
             // 检查是否完成
             if (data.finished) {
@@ -1846,6 +1847,23 @@ function updateBatchProgress(data) {
         elements.batchSuccess.dataset.last = data.success;
         elements.batchFailed.dataset.last = data.failed;
     }
+}
+
+function appendBatchLogs(logs) {
+    if (!Array.isArray(logs) || logs.length === 0) return;
+    logs.forEach((message) => {
+        const logType = getLogType(message);
+        addLog(logType, message);
+    });
+}
+
+async function syncBatchSnapshot(batchId) {
+    if (!batchId) return null;
+    const data = await api.get(`/registration/batch/${batchId}?cursor=${batchLogCursor}`);
+    appendBatchLogs(data.logs || []);
+    batchLogCursor = Number(data.next_cursor || batchLogCursor || 0);
+    updateBatchProgress(data);
+    return data;
 }
 
 // 加载最近注册任务
@@ -2282,6 +2300,7 @@ async function handleOutlookBatchRegistration() {
     // 重置批量任务状态
     batchCompleted = false;
     batchFinalStatus = null;
+    batchLogCursor = 0;
     displayedLogs.clear();  // 清空日志去重集合
     toastShown = false;  // 重置 toast 标志
 
@@ -2391,6 +2410,9 @@ function connectBatchWebSocket(batchId) {
             clearBatchWebSocketReconnect();
             // 停止轮询（如果有）
             stopBatchPolling();
+            syncBatchSnapshot(batchId).catch((error) => {
+                console.error('回补批量任务日志失败:', error);
+            });
             // 开始心跳
             startBatchWebSocketHeartbeat();
         };
@@ -2661,6 +2683,7 @@ async function restoreActiveTask() {
             isOutlookBatchMode = (mode === 'outlook_batch');
             batchCompleted = false;
             batchFinalStatus = null;
+            batchLogCursor = 0;
             toastShown = false;
             displayedLogs.clear();
             elements.startBtn.disabled = true;
